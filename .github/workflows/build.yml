@@ -85,6 +85,7 @@ jobs:
           name: "${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}"
           path: |
             sparkle-service-${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}*
+            sparkle-run-${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}*
 
   pre-release:
     needs: [build]
