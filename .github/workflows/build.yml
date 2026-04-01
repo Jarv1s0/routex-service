@@ -71,10 +71,12 @@ jobs:
           CGO_ENABLED: 0
         run: |
           go env
-          if [ "${{ matrix.jobs.goos }}" == "windows" ]; then
-            go build -ldflags "-extldflags --static -w -s -buildid=" -o sparkle-service-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
+          if [ "${{ matrix.jobs.goos }}" = "windows" ]; then
+            go build -ldflags "-extldflags --static -w -s -buildid=" -o sparkle-service-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe .
+            go build -ldflags "-extldflags --static -w -s -buildid=" -o sparkle-run.exe ./cmd/runner
+            cp sparkle-run.exe sparkle-run-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
           else
-            go build -ldflags "-extldflags --static -w -s -buildid=" -o sparkle-service-${{matrix.jobs.goos}}-${{matrix.jobs.output}}
+            go build -ldflags "-extldflags --static -w -s -buildid=" -o sparkle-service-${{matrix.jobs.goos}}-${{matrix.jobs.output}} .
           fi
 
       - name: Archive production artifacts
