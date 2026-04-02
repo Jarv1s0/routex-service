@@ -15,6 +15,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -104,14 +107,16 @@ jobs:
           deleteOnlyFromDrafts: false
 
       - name: Tag Repo
-        uses: richardsimko/update-tag@v1
-        with:
-          tag_name: pre-release
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -fa pre-release -m "pre-release"
+          git push origin refs/tags/pre-release --force
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish Prerelease
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         if: ${{  success() }}
         with:
           tag_name: pre-release
