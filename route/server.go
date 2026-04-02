@@ -7,10 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sparkle-service/log"
+	"routex-service/log"
 	"syscall"
 
-	"sparkle-service/listen"
+	"routex-service/listen"
 )
 
 var (
@@ -19,7 +19,7 @@ var (
 )
 
 func GetConfigDir() string {
-	if dir := os.Getenv("SPARKLE_CONFIG_DIR"); dir != "" {
+	if dir := os.Getenv("ROUTEX_CONFIG_DIR"); dir != "" {
 		return dir
 	}
 
@@ -36,7 +36,7 @@ func GetConfigDir() string {
 func Start(addr string) error {
 	userDataDir := GetConfigDir()
 
-	keyDir := filepath.Join(userDataDir, "sparkle", "keys")
+	keyDir := filepath.Join(userDataDir, "routex", "keys")
 
 	if err := InitKeyManager(keyDir); err != nil {
 		log.Printf("警告: 初始化密钥管理器失败: %v", err)

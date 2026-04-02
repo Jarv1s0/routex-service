@@ -19,15 +19,15 @@ var (
 )
 
 var MainCmd = &cobra.Command{
-	Use:   "sparkle-service",
-	Short: "Sparkle Service",
+	Use:   "routex-service",
+	Short: "RouteX Service",
 }
 
 func init() {
 	if runtime.GOOS == "windows" {
-		defaultAddr = "\\\\.\\pipe\\sparkle\\service"
+		defaultAddr = "\\\\.\\pipe\\routex\\service"
 	} else {
-		defaultAddr = "/tmp/sparkle-service.sock"
+		defaultAddr = "/tmp/routex-service.sock"
 	}
 
 	MainCmd.AddCommand(proxyCmd)

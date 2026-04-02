@@ -8,7 +8,7 @@ import (
 
 func InitLogging() (*os.File, error) {
 	tmpDir := os.TempDir()
-	logPath := filepath.Join(tmpDir, "sparkle-service.log")
+	logPath := filepath.Join(tmpDir, "routex-service.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, err

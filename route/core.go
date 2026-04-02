@@ -2,7 +2,7 @@ package route
 
 import (
 	"net/http"
-	"sparkle-service/core"
+	"routex-service/core"
 	"sync/atomic"
 
 	"github.com/go-chi/chi/v5"

@@ -2,7 +2,7 @@ package route
 
 import (
 	"net/http"
-	"sparkle-service/log"
+	"routex-service/log"
 	"time"
 
 	"github.com/go-chi/chi/v5"

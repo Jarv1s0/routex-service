@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
-	"sparkle-service/cmd"
+	"routex-service/cmd"
 )
 
 func main() {

@@ -72,11 +72,11 @@ jobs:
         run: |
           go env
           if [ "${{ matrix.jobs.goos }}" = "windows" ]; then
-            go build -ldflags "-extldflags --static -w -s -buildid=" -o sparkle-service-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe .
-            go build -ldflags "-extldflags --static -w -s -buildid=" -o sparkle-run.exe ./cmd/runner
-            cp sparkle-run.exe sparkle-run-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
+            go build -ldflags "-extldflags --static -w -s -buildid=" -o routex-serivce-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe .
+            go build -ldflags "-extldflags --static -w -s -buildid=" -o routex-run.exe ./cmd/runner
+            cp routex-run.exe routex-run-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
           else
-            go build -ldflags "-extldflags --static -w -s -buildid=" -o sparkle-service-${{matrix.jobs.goos}}-${{matrix.jobs.output}} .
+            go build -ldflags "-extldflags --static -w -s -buildid=" -o routex-serivce-${{matrix.jobs.goos}}-${{matrix.jobs.output}} .
           fi
 
       - name: Archive production artifacts
@@ -84,8 +84,8 @@ jobs:
         with:
           name: "${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}"
           path: |
-            sparkle-service-${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}*
-            sparkle-run-${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}*
+            routex-serivce-${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}*
+            routex-run-${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}*
 
   pre-release:
     needs: [build]

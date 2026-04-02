@@ -6,7 +6,7 @@ import (
 	"net"
 	"os"
 
-	"sparkle-service/listen/namedpipe"
+	"routex-service/listen/namedpipe"
 
 	"golang.org/x/sys/windows"
 )
