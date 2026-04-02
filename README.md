@@ -2,7 +2,7 @@
 
 此仓库现在同时构建两个二进制产物：
 
-- `routex-serivce`：主服务程序构建产物
+- `routex-service`：主服务程序构建产物
 - `routex-run.exe`：Windows 辅助启动器构建产物
 
 运行时默认命名如下：
