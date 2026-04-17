@@ -42,7 +42,18 @@ func coreStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func coreStart(w http.ResponseWriter, r *http.Request) {
-	if err := cm.StartCore(); err != nil {
+	var req core.StartConfig
+	if err := decodeRequest(r, &req); err != nil {
+		sendError(w, err)
+		return
+	}
+
+	var config *core.StartConfig
+	if !req.IsEmpty() {
+		config = &req
+	}
+
+	if err := cm.StartCore(config); err != nil {
 		sendError(w, err)
 		return
 	}
@@ -58,7 +69,18 @@ func coreStop(w http.ResponseWriter, r *http.Request) {
 }
 
 func coreRestart(w http.ResponseWriter, r *http.Request) {
-	if err := cm.RestartCore(); err != nil {
+	var req core.StartConfig
+	if err := decodeRequest(r, &req); err != nil {
+		sendError(w, err)
+		return
+	}
+
+	var config *core.StartConfig
+	if !req.IsEmpty() {
+		config = &req
+	}
+
+	if err := cm.RestartCore(config); err != nil {
 		sendError(w, err)
 		return
 	}
