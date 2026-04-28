@@ -1,113 +1,146 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
+	"routex-service/core/controller"
+	"routex-service/core/security"
+
 	"github.com/shirou/gopsutil/v4/process"
-	"golang.org/x/text/encoding/simplifiedchinese"
-	"golang.org/x/text/transform"
 )
 
 const (
-	startupGracePeriod = 500 * time.Millisecond
-	stopWaitTimeout    = 5 * time.Second
-	restartRetryDelay  = 2 * time.Second
-	restartMaxRetries  = 3
+	startTimeout          = 30 * time.Second
+	fatalIndicator        = "level=fatal"
+	monitorInterval       = 1 * time.Second
+	takeoverGracePeriod   = 10 * time.Second
+	takeoverCheckInterval = 250 * time.Millisecond
+	startupBufferLimit    = 128 * 1024
+	startupLineLimit      = 16 * 1024
 )
 
-type StartConfig struct {
-	BinaryPath string            `json:"binary_path"`
-	WorkDir    string            `json:"work_dir,omitempty"`
-	LogPath    string            `json:"log_path,omitempty"`
-	Args       []string          `json:"args,omitempty"`
-	Env        map[string]string `json:"env,omitempty"`
-}
-
-func (cfg *StartConfig) IsEmpty() bool {
-	if cfg == nil {
-		return true
-	}
-
-	return strings.TrimSpace(cfg.BinaryPath) == "" &&
-		strings.TrimSpace(cfg.WorkDir) == "" &&
-		strings.TrimSpace(cfg.LogPath) == "" &&
-		len(cfg.Args) == 0 &&
-		len(cfg.Env) == 0
-}
-
-func (cfg *StartConfig) Clone() *StartConfig {
-	if cfg == nil {
-		return nil
-	}
-
-	cloned := &StartConfig{
-		BinaryPath: cfg.BinaryPath,
-		WorkDir:    cfg.WorkDir,
-		LogPath:    cfg.LogPath,
-		Args:       append([]string(nil), cfg.Args...),
-	}
-
-	if len(cfg.Env) > 0 {
-		cloned.Env = make(map[string]string, len(cfg.Env))
-		for key, value := range cfg.Env {
-			cloned.Env[key] = value
-		}
-	}
-
-	return cloned
-}
-
-func (cfg *StartConfig) Validate() error {
-	if cfg == nil || strings.TrimSpace(cfg.BinaryPath) == "" {
-		return fmt.Errorf("缺少内核二进制路径")
-	}
-
-	cfg.BinaryPath = strings.TrimSpace(cfg.BinaryPath)
-	cfg.WorkDir = strings.TrimSpace(cfg.WorkDir)
-	cfg.LogPath = strings.TrimSpace(cfg.LogPath)
-
-	if _, err := os.Stat(cfg.BinaryPath); err != nil {
-		return fmt.Errorf("内核二进制不存在: %w", err)
-	}
-
-	if cfg.WorkDir == "" {
-		cfg.WorkDir = filepath.Dir(cfg.BinaryPath)
-	}
-
-	if err := os.MkdirAll(cfg.WorkDir, 0o755); err != nil {
-		return fmt.Errorf("创建内核工作目录失败: %w", err)
-	}
-
-	if cfg.LogPath != "" {
-		if err := os.MkdirAll(filepath.Dir(cfg.LogPath), 0o755); err != nil {
-			return fmt.Errorf("创建日志目录失败: %w", err)
-		}
-	}
-
-	return nil
+type processController interface {
+	Attach(pid int32) error
+	PIDs() ([]int32, error)
+	Stop(pid int32) error
+	Close() error
 }
 
 type CoreManager struct {
-	cmd        *exec.Cmd
-	config     *StartConfig
-	isRunning  atomic.Bool
-	monitoring atomic.Bool
-	startTime  time.Time
-	pid        atomic.Int32
+	cmd                    *exec.Cmd
+	controller             processController
+	launch                 *launchSession
+	eventHub               coreEventHub
+	isRunning              atomic.Bool
+	monitoring             atomic.Bool
+	pidPolling             atomic.Bool
+	startTime              time.Time
+	pid                    atomic.Int32
+	mutex                  sync.Mutex
+	stopChan               chan struct{}
+	trafficMonitorPipeSDDL string
+}
+
+type boundedOutputBuffer struct {
+	mutex sync.Mutex
+	buf   []byte
+	limit int
+}
+
+func newBoundedOutputBuffer(limit int) *boundedOutputBuffer {
+	if limit <= 0 {
+		limit = startupBufferLimit
+	}
+	return &boundedOutputBuffer{limit: limit}
+}
+
+func (b *boundedOutputBuffer) Write(p []byte) (int, error) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	b.buf = append(b.buf, p...)
+	if len(b.buf) > b.limit {
+		b.buf = append([]byte(nil), b.buf[len(b.buf)-b.limit:]...)
+	}
+	return len(p), nil
+}
+
+func (b *boundedOutputBuffer) String() string {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	return string(b.buf)
+}
+
+type startupLogWatcher struct {
 	mutex      sync.Mutex
-	stopChan   chan struct{}
+	lineBuffer string
+	fatal      chan error
+	reported   bool
+}
+
+func newStartupLogWatcher() *startupLogWatcher {
+	return &startupLogWatcher{fatal: make(chan error, 1)}
+}
+
+func (w *startupLogWatcher) Write(p []byte) (int, error) {
+	text := strings.ReplaceAll(string(p), "\r\n", "\n")
+
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
+	combined := w.lineBuffer + text
+	lines := strings.Split(combined, "\n")
+	if strings.HasSuffix(combined, "\n") {
+		w.lineBuffer = ""
+	} else {
+		w.lineBuffer = lines[len(lines)-1]
+		lines = lines[:len(lines)-1]
+		if len(w.lineBuffer) > startupLineLimit {
+			w.lineBuffer = w.lineBuffer[len(w.lineBuffer)-startupLineLimit:]
+		}
+	}
+
+	for _, line := range lines {
+		w.reportFatal(startupFatalLineError(line))
+	}
+	if w.lineBuffer != "" {
+		w.reportFatal(startupFatalLineError(w.lineBuffer))
+	}
+
+	return len(p), nil
+}
+
+func (w *startupLogWatcher) Fatal() <-chan error {
+	return w.fatal
+}
+
+func (w *startupLogWatcher) reportFatal(err error) {
+	if err == nil || w.reported {
+		return
+	}
+	w.reported = true
+	w.fatal <- err
+}
+
+func (s *launchSession) addCleanup(cleanup func()) {
+	if cleanup == nil {
+		return
+	}
+	previous := s.cleanup
+	s.cleanup = func() {
+		cleanup()
+		if previous != nil {
+			previous()
+		}
+	}
 }
 
 type ProcessInfo struct {
@@ -116,55 +149,160 @@ type ProcessInfo struct {
 	MemoryFormat string    `json:"memory_format"`
 	StartTime    time.Time `json:"start_time"`
 	Uptime       string    `json:"uptime"`
-	BinaryPath   string    `json:"binary_path,omitempty"`
-	WorkDir      string    `json:"work_dir,omitempty"`
-	LogPath      string    `json:"log_path,omitempty"`
+	LaunchMode   string    `json:"launch_mode,omitempty"`
+	Executable   string    `json:"executable,omitempty"`
 }
 
-func NewCoreManager() *CoreManager {
-	return &CoreManager{
-		stopChan: make(chan struct{}),
+type CoreManagerOption func(*CoreManager)
+
+func WithTrafficMonitorPipeSDDL(sddl string) CoreManagerOption {
+	return func(cm *CoreManager) {
+		cm.trafficMonitorPipeSDDL = sddl
 	}
 }
 
-func (cm *CoreManager) StartCore(config *StartConfig) error {
+func NewCoreManager(options ...CoreManagerOption) *CoreManager {
+	cm := &CoreManager{}
+	for _, option := range options {
+		if option != nil {
+			option(cm)
+		}
+	}
+	return cm
+}
+
+func (cm *CoreManager) StartCore() error {
+	return cm.StartCoreWithProfile(nil)
+}
+
+func (cm *CoreManager) StartCoreWithProfile(profile *LaunchProfile, options ...LaunchOption) error {
 	cm.mutex.Lock()
 	defer cm.mutex.Unlock()
 
-	if cm.isRunning.Load() {
+	return cm.startCoreLocked(profile, collectLaunchOptions(options))
+}
+
+func (cm *CoreManager) startCoreLocked(profile *LaunchProfile, options launchOptions) error {
+	if !cm.isRunning.CompareAndSwap(false, true) {
 		return fmt.Errorf("核心进程已在运行中")
 	}
+	cm.emitCoreEvent(CoreEventStarting, "核心正在启动", nil)
 
-	nextConfig := cm.resolveConfig(config)
-	if err := nextConfig.Validate(); err != nil {
-		return err
-	}
+	cm.stopChan = make(chan struct{})
 
-	cmd, err := cm.buildCommand(nextConfig)
+	return cm.startProcessLocked(profile, options)
+}
+
+func (cm *CoreManager) startProcessLocked(profile *LaunchProfile, options launchOptions) error {
+	errBuffer := newBoundedOutputBuffer(startupBufferLimit)
+	startupWatcher := newStartupLogWatcher()
+
+	launch, err := cm.prepareLaunchSession(profile, options)
 	if err != nil {
+		cm.monitoring.Store(false)
+		cm.signalStopLocked()
+		cm.isRunning.Store(false)
+		cm.emitCoreEvent(CoreEventFailed, "核心启动失败", err)
 		return err
 	}
+
+	logWriter := newBoundedLogWriter(coreLogSettings{
+		path:     launch.logPath,
+		saveLogs: launch.saveLogs,
+		maxBytes: launch.maxLogBytes,
+		access:   launch.fileAccess,
+	})
+	launch.logWriter = logWriter
+
+	controller := newProcessController()
+	cmd, err := newCoreLauncher().Command(launch)
+	if err != nil {
+		if closeErr := logWriter.Close(); closeErr != nil {
+			log.Printf("关闭核心日志文件失败: %v", closeErr)
+		}
+		controller.Close()
+		launch.cleanupNow()
+		cm.monitoring.Store(false)
+		cm.signalStopLocked()
+		cm.isRunning.Store(false)
+		cm.emitCoreEvent(CoreEventFailed, "核心启动失败", err)
+		return err
+	}
+	launch.addCleanup(func() {
+		if err := logWriter.Close(); err != nil {
+			log.Printf("关闭核心日志文件失败: %v", err)
+		}
+	})
+	cmd.Stdout = io.MultiWriter(startupWatcher, logWriter)
+	cmd.Stderr = io.MultiWriter(errBuffer, startupWatcher, logWriter)
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("启动核心进程失败: %w", err)
+		controller.Close()
+		launch.cleanupNow()
+		cm.monitoring.Store(false)
+		cm.signalStopLocked()
+		cm.isRunning.Store(false)
+		startErr := fmt.Errorf("启动核心进程失败：%w", err)
+		cm.emitCoreEvent(CoreEventFailed, "核心启动失败", startErr)
+		return startErr
+	}
+
+	pid := int32(cmd.Process.Pid)
+	if err := controller.Attach(pid); err != nil {
+		_ = cmd.Process.Kill()
+		controller.Close()
+		launch.cleanupNow()
+		cm.monitoring.Store(false)
+		cm.signalStopLocked()
+		cm.isRunning.Store(false)
+		attachErr := fmt.Errorf("附加核心进程控制失败：%w", err)
+		cm.emitCoreEvent(CoreEventFailed, "核心启动失败", attachErr)
+		return attachErr
+	}
+
+	if err := setProcessPriority(pid, launch.cpuPriority); err != nil {
+		log.Printf("设置核心进程优先级失败: %v", err)
 	}
 
 	cm.cmd = cmd
-	cm.config = nextConfig.Clone()
-	cm.stopChan = make(chan struct{})
+	cm.controller = controller
+	cm.launch = launch
+	cm.pid.Store(pid)
 	cm.startTime = time.Now()
-	cm.pid.Store(int32(cmd.Process.Pid))
-	cm.isRunning.Store(true)
-	cm.monitoring.Store(true)
 
-	if err := cm.waitForStartup(cmd.Process.Pid); err != nil {
+	processDone := make(chan error, 1)
+	go func() {
+		processDone <- cmd.Wait()
+	}()
+
+	if err := cm.waitForStartup(launch, errBuffer, startupWatcher.Fatal(), processDone); err != nil {
+		_ = cm.stopProcessLocked()
 		cm.monitoring.Store(false)
-		_ = cm.stopProcess()
+		cm.signalStopLocked()
 		cm.cleanupLocked()
+		cm.emitCoreEvent(CoreEventFailed, "核心启动失败", err)
 		return err
 	}
+	if err := hardenLaunchControllerEndpoint(launch); err != nil {
+		_ = cm.stopProcessLocked()
+		cm.monitoring.Store(false)
+		cm.signalStopLocked()
+		cm.cleanupLocked()
+		cm.emitCoreEvent(CoreEventFailed, "核心启动失败", err)
+		return err
+	}
+	if cleanup, err := startTrafficMonitorProxy(launch, cm.trafficMonitorPipeSDDL); err != nil {
+		log.Printf("启动 TrafficMonitor 兼容 pipe 失败: %v", err)
+	} else {
+		launch.addCleanup(cleanup)
+	}
+	cm.monitoring.Store(true)
+	go cm.monitorProcess(cmd, errBuffer, processDone)
+	if launch.readyNotify != nil {
+		go cm.monitorStartupNotifications(launch, cm.stopChan)
+	}
+	cm.emitCoreEvent(CoreEventStarted, "核心已启动", nil)
 
-	go cm.monitorProcess(cmd, nextConfig.Clone())
 	return nil
 }
 
@@ -172,272 +310,318 @@ func (cm *CoreManager) StopCore() error {
 	cm.mutex.Lock()
 	defer cm.mutex.Unlock()
 
-	if !cm.isRunning.Load() {
+	return cm.stopCoreLocked()
+}
+
+func (cm *CoreManager) stopCoreLocked() error {
+	if cm.pid.Load() == 0 && cm.controller == nil && cm.launch == nil && !cm.isRunning.Load() {
 		return nil
 	}
 
+	cm.emitCoreEvent(CoreEventStopping, "核心正在停止", nil)
 	cm.monitoring.Store(false)
-	close(cm.stopChan)
+	cm.signalStopLocked()
 
-	if err := cm.stopProcess(); err != nil {
-		return err
-	}
-
+	stopErr := cm.stopProcessLocked()
 	cm.cleanupLocked()
+	if stopErr != nil {
+		return stopErr
+	}
+	cm.emitCoreEvent(CoreEventStopped, "核心已停止", nil)
 	return nil
 }
 
-func (cm *CoreManager) RestartCore(config *StartConfig) error {
+func (cm *CoreManager) RestartCore() error {
+	return cm.RestartCoreWithProfile(nil)
+}
+
+func (cm *CoreManager) RestartCoreWithProfile(profile *LaunchProfile, options ...LaunchOption) error {
 	cm.mutex.Lock()
 	defer cm.mutex.Unlock()
 
-	nextConfig := cm.resolveConfig(config)
-	if err := nextConfig.Validate(); err != nil {
-		return err
+	cm.emitCoreEvent(CoreEventRestarting, "核心正在重启", nil)
+	if err := cm.stopCoreLocked(); err != nil {
+		log.Printf("停止进程时出错: %v", err)
 	}
 
-	if cm.isRunning.Load() {
-		cm.monitoring.Store(false)
-		close(cm.stopChan)
-		if err := cm.stopProcess(); err != nil {
-			return err
-		}
-		cm.cleanupLocked()
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	cmd, err := cm.buildCommand(nextConfig)
-	if err != nil {
-		return err
-	}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("启动核心进程失败: %w", err)
-	}
-
-	cm.cmd = cmd
-	cm.config = nextConfig.Clone()
-	cm.stopChan = make(chan struct{})
-	cm.startTime = time.Now()
-	cm.pid.Store(int32(cmd.Process.Pid))
-	cm.isRunning.Store(true)
-	cm.monitoring.Store(true)
-
-	if err := cm.waitForStartup(cmd.Process.Pid); err != nil {
-		cm.monitoring.Store(false)
-		_ = cm.stopProcess()
-		cm.cleanupLocked()
-		return err
-	}
-
-	go cm.monitorProcess(cmd, nextConfig.Clone())
-	return nil
+	time.Sleep(100 * time.Millisecond)
+	return cm.startCoreLocked(profile, collectLaunchOptions(options))
 }
 
-func (cm *CoreManager) GetProcessInfo() (*ProcessInfo, error) {
+func (cm *CoreManager) ApplyLaunchProfile(profile LaunchProfile, options ...LaunchOption) {
 	cm.mutex.Lock()
 	defer cm.mutex.Unlock()
 
-	if !cm.isRunning.Load() || cm.pid.Load() <= 0 || !isProcessRunning(cm.pid.Load()) {
-		cm.cleanupLocked()
-		return nil, fmt.Errorf("进程未运行")
-	}
-
-	proc, err := process.NewProcess(cm.pid.Load())
-	if err != nil {
-		cm.cleanupLocked()
-		return nil, fmt.Errorf("获取进程信息失败: %w", err)
-	}
-
-	info := &ProcessInfo{
-		PID:       cm.pid.Load(),
-		StartTime: cm.startTime,
-		Uptime:    formatUptime(time.Since(cm.startTime)),
-	}
-
-	if cm.config != nil {
-		info.BinaryPath = cm.config.BinaryPath
-		info.WorkDir = cm.config.WorkDir
-		info.LogPath = cm.config.LogPath
-	}
-
-	if memInfo, err := proc.MemoryInfo(); err == nil {
-		info.Memory = memInfo.RSS
-		info.MemoryFormat = formatMemory(memInfo.RSS)
-	}
-
-	return info, nil
-}
-
-func (cm *CoreManager) resolveConfig(config *StartConfig) *StartConfig {
-	if config != nil && !config.IsEmpty() {
-		return config.Clone()
-	}
-	if cm.config != nil {
-		return cm.config.Clone()
-	}
-	return &StartConfig{}
-}
-
-func (cm *CoreManager) buildCommand(config *StartConfig) (*exec.Cmd, error) {
-	cmd := exec.Command(config.BinaryPath, config.Args...)
-	cmd.Dir = config.WorkDir
-
-	env := append([]string(nil), os.Environ()...)
-	for key, value := range config.Env {
-		env = append(env, fmt.Sprintf("%s=%s", key, value))
-	}
-	cmd.Env = env
-
-	if config.LogPath != "" {
-		stdout, err := os.OpenFile(config.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			return nil, fmt.Errorf("打开日志文件失败: %w", err)
-		}
-
-		stderr, err := os.OpenFile(config.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			_ = stdout.Close()
-			return nil, fmt.Errorf("打开日志文件失败: %w", err)
-		}
-
-		cmd.Stdout = stdout
-		cmd.Stderr = stderr
-	} else {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-	}
-
-	return cmd, nil
-}
-
-func (cm *CoreManager) waitForStartup(pid int) error {
-	deadline := time.Now().Add(startupGracePeriod)
-	for time.Now().Before(deadline) {
-		if !isProcessRunning(int32(pid)) {
-			return fmt.Errorf("核心进程启动后立即退出")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	if !isProcessRunning(int32(pid)) {
-		return fmt.Errorf("核心进程启动失败")
-	}
-
-	return nil
-}
-
-func (cm *CoreManager) monitorProcess(cmd *exec.Cmd, config *StartConfig) {
-	err := cmd.Wait()
-	if !cm.monitoring.Load() || cmd.Process == nil || cm.pid.Load() != int32(cmd.Process.Pid) {
+	if cm.launch == nil {
 		return
 	}
 
-	if err != nil {
-		log.Printf("核心进程异常退出: %v", err)
-	} else {
-		log.Printf("核心进程已退出 (PID: %d)", cmd.Process.Pid)
+	launchOptions := collectLaunchOptions(options)
+	access := cm.launch.fileAccess
+	if launchOptions.fileAccess.ok {
+		access = launchOptions.fileAccess
 	}
+	settings := coreLogSettingsFromProfile(profile, access)
+	cm.launch.profile.LogPath = profile.LogPath
+	cm.launch.profile.SaveLogs = profile.SaveLogs
+	cm.launch.profile.MaxLogFileSizeMB = profile.MaxLogFileSizeMB
+	cm.launch.fileAccess = settings.access
+	cm.launch.logPath = settings.path
+	cm.launch.saveLogs = settings.saveLogs
+	cm.launch.maxLogBytes = settings.maxBytes
 
+	if cm.launch.logWriter != nil {
+		cm.launch.logWriter.Update(settings)
+	}
+}
+
+func (cm *CoreManager) ControllerEndpoint() (string, string, error) {
 	cm.mutex.Lock()
-	cm.cleanupLocked()
-	cm.mutex.Unlock()
+	defer cm.mutex.Unlock()
 
-	go cm.restartWithBackoff(config)
-}
-
-func (cm *CoreManager) restartWithBackoff(config *StartConfig) {
-	if config == nil {
-		return
+	if cm.launch == nil || cm.launch.controllerNet == "" || cm.launch.controllerAddr == "" {
+		return "", "", fmt.Errorf("核心控制器未初始化")
 	}
 
-	for attempt := range restartMaxRetries {
-		if !cm.monitoring.Load() {
-			return
-		}
-
-		time.Sleep(restartRetryDelay)
-		if err := cm.StartCore(config); err != nil {
-			log.Printf("重启核心进程失败 (尝试 %d/%d): %v", attempt+1, restartMaxRetries, err)
-			continue
-		}
-
-		log.Println("核心进程已成功重启")
-		return
-	}
-
-	log.Println("达到最大重试次数，重启失败")
+	return cm.launch.controllerNet, cm.launch.controllerAddr, nil
 }
 
-func (cm *CoreManager) stopProcess() error {
+func (cm *CoreManager) stopProcessLocked() error {
 	pid := cm.pid.Load()
-	if pid <= 0 {
+	if pid <= 0 || cm.controller == nil {
 		return nil
 	}
-
-	if cm.cmd != nil && cm.cmd.Process != nil {
-		if err := cm.cmd.Process.Kill(); err == nil {
-			return waitForProcessExit(pid)
-		}
-	}
-
-	if runtime.GOOS == "windows" {
-		return stopProcessWindows(pid)
-	}
-
-	return stopProcessUnix(pid)
+	return cm.controller.Stop(pid)
 }
 
 func (cm *CoreManager) cleanupLocked() {
+	if cm.controller != nil {
+		_ = cm.controller.Close()
+		cm.controller = nil
+	}
+	if cm.launch != nil {
+		cm.launch.cleanupNow()
+		cm.launch = nil
+	}
+
 	cm.cmd = nil
-	cm.config = nil
 	cm.startTime = time.Time{}
 	cm.pid.Store(0)
 	cm.isRunning.Store(false)
 }
 
-func stopProcessWindows(pid int32) error {
-	cmd := exec.Command("taskkill", "/PID", strconv.Itoa(int(pid)), "/T", "/F")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		outputStr := convertGBKToUTF8(output)
-		if strings.Contains(outputStr, "没有找到进程") ||
-			strings.Contains(strings.ToLower(outputStr), "not found") {
-			return nil
-		}
-		return fmt.Errorf("终止进程失败: %v, output: %s", err, outputStr)
+func (cm *CoreManager) signalStopLocked() {
+	if cm.stopChan != nil {
+		close(cm.stopChan)
+		cm.stopChan = nil
 	}
-
-	return waitForProcessExit(pid)
 }
 
-func stopProcessUnix(pid int32) error {
-	proc, err := os.FindProcess(int(pid))
+func (cm *CoreManager) monitorProcess(cmd *exec.Cmd, errBuffer *boundedOutputBuffer, processDone <-chan error) {
+	err := <-processDone
+	if !cm.monitoring.Load() {
+		return
+	}
+
+	cm.mutex.Lock()
+	if cm.cmd != cmd {
+		cm.mutex.Unlock()
+		return
+	}
+	cm.mutex.Unlock()
+
 	if err != nil {
-		return nil
+		log.Printf("核心进程异常退出: %v\n错误输出: %s", err, errBuffer.String())
+	} else {
+		log.Printf("核心进程已退出 (PID: %d)", cmd.Process.Pid)
+	}
+	cm.publishCoreEvent(cm.newCoreEvent(CoreEventExited, "核心进程已退出", err, int32(cmd.Process.Pid), 0))
+
+	cm.handleProcessExit()
+}
+
+func (cm *CoreManager) monitorStartupNotifications(launch *launchSession, stopChan <-chan struct{}) {
+	for {
+		select {
+		case _, ok := <-launch.readyNotify:
+			if !ok {
+				return
+			}
+			cm.handleStartupNotification(launch)
+		case <-stopChan:
+			return
+		}
+	}
+}
+
+func (cm *CoreManager) handleStartupNotification(launch *launchSession) {
+	cm.mutex.Lock()
+	if !cm.monitoring.Load() || !cm.isRunning.Load() || cm.launch != launch {
+		cm.mutex.Unlock()
+		return
+	}
+	oldPID := cm.pid.Load()
+	controller := cm.controller
+	cm.mutex.Unlock()
+
+	if err := security.SecureBinary(launch.sourcePath); err != nil {
+		log.Printf("核心启动通知后加固核心文件失败: %v", err)
+	}
+	if err := hardenLaunchControllerEndpoint(launch); err != nil {
+		log.Printf("核心启动通知后加固核心控制器 IPC 失败: %v", err)
 	}
 
-	if err := proc.Signal(syscall.SIGTERM); err != nil && !strings.Contains(strings.ToLower(err.Error()), "finished") {
-		return fmt.Errorf("终止进程失败: %w", err)
+	newPID := oldPID
+	if controller != nil {
+		if pid, ok := findManagedCorePID(controller, oldPID, launch); ok {
+			newPID = pid
+		}
 	}
 
-	deadline := time.Now().Add(stopWaitTimeout)
+	cm.mutex.Lock()
+	if !cm.monitoring.Load() || cm.launch != launch || cm.controller != controller {
+		cm.mutex.Unlock()
+		return
+	}
+	if newPID != oldPID {
+		cm.cmd = nil
+		cm.pid.Store(newPID)
+		cm.updateStartTimeFromPIDLocked(newPID)
+		cm.startPIDPollingLocked(cm.stopChan)
+	}
+	cm.mutex.Unlock()
+
+	if newPID != oldPID {
+		log.Printf("核心进程已通过启动通知重新接管 (PID: %d -> %d)", oldPID, newPID)
+		cm.publishCoreEvent(cm.newCoreEvent(CoreEventTakeover, "核心进程已重新接管", nil, newPID, oldPID))
+		return
+	}
+	cm.publishCoreEvent(cm.newCoreEvent(CoreEventReady, "核心已重新就绪", nil, newPID, 0))
+}
+
+func (cm *CoreManager) handleProcessExit() {
+	if cm.takeoverRestartedProcess() {
+		return
+	}
+
+	cm.mutex.Lock()
+
+	if cm.pid.Load() == 0 && cm.controller == nil && cm.launch == nil && !cm.isRunning.Load() {
+		cm.mutex.Unlock()
+		return
+	}
+
+	profile := LaunchProfile{}
+	access := fileAccess{}
+	if cm.launch != nil {
+		profile = cm.launch.profile
+		access = cm.launch.fileAccess
+	}
+	cm.emitCoreEvent(CoreEventRestarting, "核心异常退出，正在重启", nil)
+	cm.monitoring.Store(false)
+	cm.signalStopLocked()
+	cm.cleanupLocked()
+	cm.mutex.Unlock()
+
+	go func() {
+		for retries := range 3 {
+			if err := cm.StartCoreWithProfile(&profile, withFileAccess(access)); err != nil {
+				log.Printf("重启核心进程失败 (尝试 %d/3): %v", retries+1, err)
+				time.Sleep(time.Second * time.Duration(retries+1))
+				continue
+			}
+			log.Println("核心进程已成功重启")
+			return
+		}
+		err := fmt.Errorf("达到最大重试次数，重启失败")
+		cm.emitCoreEvent(CoreEventRestartFailed, "核心重启失败", err)
+		log.Println(err)
+	}()
+}
+
+func (cm *CoreManager) takeoverRestartedProcess() bool {
+	deadline := time.Now().Add(takeoverGracePeriod)
+
 	for time.Now().Before(deadline) {
-		if !isProcessRunning(pid) {
-			return nil
+		cm.mutex.Lock()
+		if !cm.monitoring.Load() || !cm.isRunning.Load() || cm.controller == nil || cm.launch == nil {
+			cm.mutex.Unlock()
+			return false
 		}
-		time.Sleep(100 * time.Millisecond)
+
+		oldPID := cm.pid.Load()
+		controller := cm.controller
+		launch := cm.launch
+		cm.mutex.Unlock()
+
+		newPID, ok := findManagedCorePID(controller, oldPID, launch)
+		if ok {
+			if err := security.SecureBinary(launch.sourcePath); err != nil {
+				log.Printf("重新接管前加固核心文件失败: %v", err)
+				_ = controller.Stop(newPID)
+				return false
+			}
+			if err := hardenLaunchControllerEndpoint(launch); err != nil {
+				log.Printf("重新接管前加固核心控制器 IPC 失败: %v", err)
+				_ = controller.Stop(newPID)
+				return false
+			}
+
+			cm.mutex.Lock()
+			if cm.monitoring.Load() && cm.controller == controller {
+				cm.cmd = nil
+				cm.pid.Store(newPID)
+				cm.updateStartTimeFromPIDLocked(newPID)
+				cm.startPIDPollingLocked(cm.stopChan)
+				cm.mutex.Unlock()
+				log.Printf("核心进程已重新接管 (PID: %d -> %d)", oldPID, newPID)
+				cm.publishCoreEvent(cm.newCoreEvent(CoreEventTakeover, "核心进程已重新接管", nil, newPID, oldPID))
+				return true
+			}
+			cm.mutex.Unlock()
+			return false
+		}
+
+		time.Sleep(takeoverCheckInterval)
 	}
 
-	if err := proc.Signal(syscall.SIGKILL); err != nil && !strings.Contains(strings.ToLower(err.Error()), "finished") {
-		return fmt.Errorf("强制终止进程失败: %w", err)
-	}
-
-	return waitForProcessExit(pid)
+	return false
 }
 
-func isProcessRunning(pid int32) bool {
-	if pid <= 0 {
+func findManagedCorePID(controller processController, oldPID int32, launch *launchSession) (int32, bool) {
+	pids, err := controller.PIDs()
+	if err != nil {
+		log.Printf("查询核心进程组失败: %v", err)
+		return 0, false
+	}
+
+	var bestPID int32
+	var bestCreateTime int64
+	for _, pid := range pids {
+		if pid <= 0 || pid == oldPID {
+			continue
+		}
+		if !isCoreProcessCandidate(pid, launch) {
+			continue
+		}
+
+		createTime := int64(0)
+		if proc, err := process.NewProcess(pid); err == nil {
+			if value, err := proc.CreateTime(); err == nil {
+				createTime = value
+			}
+		}
+		if bestPID == 0 || createTime >= bestCreateTime {
+			bestPID = pid
+			bestCreateTime = createTime
+		}
+	}
+
+	return bestPID, bestPID != 0
+}
+
+func isCoreProcessCandidate(pid int32, launch *launchSession) bool {
+	if launch == nil {
 		return false
 	}
 
@@ -446,24 +630,192 @@ func isProcessRunning(pid int32) bool {
 		return false
 	}
 
-	running, err := proc.IsRunning()
+	expectedName := strings.ToLower(filepath.Base(launch.executablePath))
+	if name, err := proc.Name(); err == nil && strings.ToLower(name) == expectedName {
+		return true
+	}
+
+	if exe, err := proc.Exe(); err == nil && strings.EqualFold(exe, launch.executablePath) {
+		return true
+	}
+
+	return false
+}
+
+func (cm *CoreManager) updateStartTimeFromPIDLocked(pid int32) {
+	proc, err := process.NewProcess(pid)
+	if err != nil {
+		cm.startTime = time.Now()
+		return
+	}
+
+	createTime, err := proc.CreateTime()
+	if err != nil {
+		cm.startTime = time.Now()
+		return
+	}
+
+	cm.startTime = time.UnixMilli(createTime)
+}
+
+func (cm *CoreManager) startPIDPollingLocked(stopChan <-chan struct{}) {
+	if stopChan == nil || !cm.pidPolling.CompareAndSwap(false, true) {
+		return
+	}
+	go cm.monitorPID(stopChan)
+}
+
+func (cm *CoreManager) monitorPID(stopChan <-chan struct{}) {
+	defer cm.pidPolling.Store(false)
+
+	ticker := time.NewTicker(monitorInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if !cm.monitoring.Load() {
+				return
+			}
+
+			pid := cm.pid.Load()
+			if pid <= 0 {
+				continue
+			}
+
+			exists, err := process.PidExists(pid)
+			if err != nil {
+				log.Printf("检查核心进程失败: %v", err)
+				continue
+			}
+			if !exists && cm.isRunning.Load() {
+				log.Printf("核心进程已终止 (PID: %d)", pid)
+				cm.handleProcessExit()
+			}
+		case <-stopChan:
+			return
+		}
+	}
+}
+
+func (cm *CoreManager) waitForStartup(launch *launchSession, errBuffer *boundedOutputBuffer, startupFatal <-chan error, processDone <-chan error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
+	defer cancel()
+
+	if launch.waitReady == nil {
+		return fmt.Errorf("核心启动通知未初始化")
+	}
+
+	ready := make(chan error, 1)
+	go func() {
+		ready <- launch.waitReady(ctx)
+	}()
+
+	for {
+		select {
+		case err := <-ready:
+			if err != nil {
+				return fmt.Errorf("等待核心 post-up 通知失败：%w", err)
+			}
+			return nil
+		case err := <-startupFatal:
+			if err != nil {
+				return err
+			}
+		case err := <-processDone:
+			if err != nil {
+				return fmt.Errorf("核心进程启动前退出：%w，错误输出: %s", err, errBuffer.String())
+			}
+			return fmt.Errorf("核心进程启动前退出")
+		case <-ctx.Done():
+			return fmt.Errorf("启动核心进程超时")
+		}
+	}
+}
+
+func hardenLaunchControllerEndpoint(launch *launchSession) error {
+	if launch == nil {
+		return nil
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err := controller.HardenEndpoint(launch.controllerNet, launch.controllerAddr)
+		if err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func startupFatalLineError(line string) error {
+	lower := strings.ToLower(line)
+	switch {
+	case strings.Contains(lower, fatalIndicator):
+		return extractFatalError(line)
+	case strings.Contains(line, "External controller pipe listen error"),
+		strings.Contains(line, "External controller unix listen error"),
+		strings.Contains(line, "External controller listen error"):
+		return fmt.Errorf("控制器监听失败：%s", strings.TrimSpace(line))
+	case strings.Contains(line, "Start TUN listening error"):
+		return fmt.Errorf("虚拟网卡启动失败：%s", strings.TrimSpace(line))
+	default:
+		return nil
+	}
+}
+
+func (cm *CoreManager) IsHealthy() bool {
+	if !cm.isRunning.Load() {
+		return false
+	}
+
+	info, err := cm.GetProcessInfo()
 	if err != nil {
 		return false
 	}
 
-	return running
-}
-
-func waitForProcessExit(pid int32) error {
-	deadline := time.Now().Add(stopWaitTimeout)
-	for time.Now().Before(deadline) {
-		if !isProcessRunning(pid) {
-			return nil
-		}
-		time.Sleep(100 * time.Millisecond)
+	if info.Memory > 1024*1024*1024 {
+		log.Printf("警告: 核心进程内存使用过高 (%s)", info.MemoryFormat)
 	}
 
-	return nil
+	return true
+}
+
+func (cm *CoreManager) GetProcessInfo() (*ProcessInfo, error) {
+	cm.mutex.Lock()
+	pid := cm.pid.Load()
+	startTime := cm.startTime
+	launch := cm.launch
+	cm.mutex.Unlock()
+
+	if !cm.isRunning.Load() || pid <= 0 {
+		return nil, fmt.Errorf("进程未运行")
+	}
+
+	proc, err := process.NewProcess(pid)
+	if err != nil {
+		return nil, fmt.Errorf("获取进程信息失败：%w", err)
+	}
+
+	info := &ProcessInfo{
+		PID:       pid,
+		StartTime: startTime,
+		Uptime:    formatUptime(time.Since(startTime)),
+	}
+	if launch != nil {
+		info.LaunchMode = "managed"
+		info.Executable = launch.sourcePath
+	}
+
+	if memInfo, err := proc.MemoryInfo(); err == nil {
+		info.Memory = memInfo.RSS
+		info.MemoryFormat = formatMemory(memInfo.RSS)
+	}
+
+	return info, nil
 }
 
 func formatMemory(bytes uint64) string {
@@ -506,11 +858,10 @@ func formatUptime(d time.Duration) string {
 	return strings.Join(parts, " ")
 }
 
-func convertGBKToUTF8(b []byte) string {
-	reader := transform.NewReader(strings.NewReader(string(b)), simplifiedchinese.GBK.NewDecoder())
-	output, err := io.ReadAll(reader)
-	if err != nil {
-		return string(b)
+func extractFatalError(output string) error {
+	if _, after, ok := strings.Cut(output, "level=fatal msg="); ok {
+		msg := strings.TrimSpace(after)
+		return fmt.Errorf("启动核心进程失败: %s", msg)
 	}
-	return string(output)
+	return fmt.Errorf("启动核心进程失败：发现致命错误")
 }
