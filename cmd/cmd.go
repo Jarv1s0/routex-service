@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"runtime"
 
 	"github.com/spf13/cobra"
@@ -20,8 +21,31 @@ var (
 )
 
 var MainCmd = &cobra.Command{
-	Use:   "routex-service",
-	Short: "RouteX Service",
+	Use:           "routex-service",
+	Short:         "RouteX Service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+}
+
+type reportedError struct {
+	err error
+}
+
+func (e reportedError) Error() string {
+	return e.err.Error()
+}
+
+func (e reportedError) Unwrap() error {
+	return e.err
+}
+
+func newReportedError(err error) error {
+	return reportedError{err: err}
+}
+
+func IsReportedError(err error) bool {
+	var target reportedError
+	return errors.As(err, &target)
 }
 
 func init() {
@@ -31,12 +55,14 @@ func init() {
 		defaultAddr = "/tmp/routex-service.sock"
 	}
 
-	MainCmd.AddCommand(proxyCmd)
-	MainCmd.AddCommand(pacCmd)
-	MainCmd.AddCommand(disableCmd)
-	MainCmd.AddCommand(statusCmd)
+	MainCmd.AddCommand(sysproxyCmd)
 	MainCmd.AddCommand(serverCmd)
 	MainCmd.AddCommand(serviceCmd)
+
+	sysproxyCmd.AddCommand(proxyCmd)
+	sysproxyCmd.AddCommand(pacCmd)
+	sysproxyCmd.AddCommand(disableCmd)
+	sysproxyCmd.AddCommand(statusCmd)
 
 	MainCmd.PersistentFlags().BoolVarP(&onlyActiveDevice, "only-active-device", "a", false, "仅对活跃的网络设备生效")
 	MainCmd.PersistentFlags().BoolVarP(&useRegistry, "use-registry", "r", false, "使用注册表设置")

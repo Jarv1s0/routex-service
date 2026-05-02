@@ -1,12 +1,59 @@
 # routex-service
 
-此仓库现在同时构建两个二进制产物：
+`routex-service` is the RouteX system service component, forked from upstream `sparkle-service`.
 
-- `routex-service`：主服务程序构建产物
-- `routex-run.exe`：Windows 辅助启动器构建产物
+This repository builds two runtime binaries:
 
-运行时默认命名如下：
+- `routex-service`: the main background service.
+- `routex-run.exe`: the Windows helper used by scheduled tasks to launch RouteX with elevated privileges.
 
-- CLI 命令名：`routex-service`
-- Windows 命名管道：`\\.\pipe\routex\service`
-- Unix Socket：`/tmp/routex-service.sock`
+Runtime defaults:
+
+- CLI command: `routex-service`
+- Windows named pipe: `\\.\pipe\routex\service`
+- Unix socket: `/tmp/routex-service.sock`
+
+## Build
+
+```bash
+go build -o routex-service .
+```
+
+## Service Commands
+
+```bash
+routex-service service install
+routex-service service uninstall
+routex-service service start
+routex-service service stop
+routex-service service restart
+routex-service service status
+```
+
+## Sysproxy Commands
+
+Upstream moved system proxy operations under the `sysproxy` subcommand.
+
+```bash
+routex-service sysproxy proxy -s 127.0.0.1:7890 -b "localhost;127.*;10.*;192.168.*"
+routex-service sysproxy pac -u http://127.0.0.1:7890/pac
+routex-service sysproxy disable
+routex-service sysproxy status
+```
+
+## HTTP API
+
+The service listens on the local named pipe or Unix socket and exposes routes for:
+
+- `/ping`
+- `/core`
+- `/sysproxy`
+- `/sys`
+- `/service`
+
+Protected APIs use the upstream Ed25519 request signing flow plus OS-level caller identity checks.
+
+RouteX-specific key storage defaults to:
+
+- Windows: `C:\ProgramData\routex\keys`
+- Unix-like systems: `<config-dir>/routex/keys`
