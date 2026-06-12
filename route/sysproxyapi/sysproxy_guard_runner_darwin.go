@@ -27,6 +27,13 @@ func (darwinSysproxyGuardRunner) WaitChange(ctx context.Context, opts *sysproxy.
 	return sysproxy.WaitProxySettingsChange(ctx, opts)
 }
 
+func (r darwinSysproxyGuardRunner) WaitChangeReady(ctx context.Context, opts *sysproxy.Options, ready func()) error {
+	if ready != nil {
+		ready()
+	}
+	return r.WaitChange(ctx, opts)
+}
+
 func (darwinSysproxyGuardRunner) Close() error {
 	return nil
 }
