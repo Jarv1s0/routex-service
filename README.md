@@ -114,7 +114,7 @@ routex-service --use-registry sysproxy status
 routex-service --device Meta sys tun-cleanup --fake-ip-ranges 198.18.0.0/15
 ```
 
-该命令仅在指定网卡存在 Fake-IP 地址、DNS 或路由时执行清理，用于移除 TUN 关闭后残留的默认路由、DNS 指向和虚拟网卡启用状态。
+该命令仅在指定网卡存在 Fake-IP 地址、DNS、路由或可识别的 TUN 适配器特征时执行清理，用于移除 TUN 关闭后残留的默认路由、DNS 指向和虚拟网卡设备。
 
 ## 测试用服务入口
 

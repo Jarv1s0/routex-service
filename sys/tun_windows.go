@@ -12,6 +12,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
 var (
@@ -19,11 +20,22 @@ var (
 	procDeleteIpForwardEntry2 = iphlpapi.NewProc("DeleteIpForwardEntry2")
 )
 
+var errTunAdapterNotFound = errors.New("找不到 TUN 网卡")
+
+var netClassGUID = &windows.GUID{
+	Data1: 0x4d36e972,
+	Data2: 0xe325,
+	Data3: 0x11ce,
+	Data4: [8]byte{0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18},
+}
+
 type tunAdapterInfo struct {
-	name           string
-	index          uint32
-	hasFakeAddress bool
-	hasFakeDNS     bool
+	name             string
+	description      string
+	netCfgInstanceID string
+	index            uint32
+	hasFakeAddress   bool
+	hasFakeDNS       bool
 }
 
 func parseFakeIPRanges(values []string) ([]*net.IPNet, error) {
@@ -81,7 +93,7 @@ func getTunAdapterInfo(device string, ranges []*net.IPNet) (*tunAdapterInfo, err
 		return nil, err
 	}
 	if size == 0 {
-		return nil, fmt.Errorf("找不到 TUN 网卡: %s", device)
+		return nil, fmt.Errorf("%w: %s", errTunAdapterNotFound, device)
 	}
 
 	buffer := make([]byte, size)
@@ -96,7 +108,12 @@ func getTunAdapterInfo(device string, ranges []*net.IPNet) (*tunAdapterInfo, err
 			continue
 		}
 
-		info := &tunAdapterInfo{name: name, index: adapter.IfIndex}
+		info := &tunAdapterInfo{
+			name:             name,
+			description:      windows.UTF16PtrToString(adapter.Description),
+			netCfgInstanceID: windows.BytePtrToString(adapter.AdapterName),
+			index:            adapter.IfIndex,
+		}
 		for addr := adapter.FirstUnicastAddress; addr != nil; addr = addr.Next {
 			if ipInRanges(addr.Address.IP(), ranges) {
 				info.hasFakeAddress = true
@@ -112,7 +129,7 @@ func getTunAdapterInfo(device string, ranges []*net.IPNet) (*tunAdapterInfo, err
 		return info, nil
 	}
 
-	return nil, fmt.Errorf("找不到 TUN 网卡: %s", device)
+	return nil, fmt.Errorf("%w: %s", errTunAdapterNotFound, device)
 }
 
 func deleteIpForwardEntry2(row *windows.MibIpForwardRow2) error {
@@ -176,12 +193,96 @@ func resetInterfaceDNS(device string) error {
 	return runNetsh("interface", "ipv4", "set", "dnsservers", "name="+device, "source=dhcp")
 }
 
-func disableInterface(device string) error {
-	return runNetsh("interface", "set", "interface", "name="+device, "admin=disabled")
-}
-
 func flushDNSCache() {
 	_ = exec.Command("ipconfig", "/flushdns").Run()
+}
+
+func isKnownTunAdapter(adapter tunAdapterInfo) bool {
+	value := strings.ToLower(adapter.name + " " + adapter.description)
+	return strings.Contains(value, "wintun") ||
+		strings.Contains(value, "mihomo") ||
+		strings.Contains(value, "clash")
+}
+
+func normalizeNetCfgInstanceID(value string) string {
+	return strings.ToLower(strings.Trim(strings.TrimSpace(value), "{}"))
+}
+
+func deviceNetCfgInstanceID(devInfo windows.DevInfo, devInfoData *windows.DevInfoData) (string, error) {
+	keyHandle, err := devInfo.OpenDevRegKey(
+		devInfoData,
+		windows.DICS_FLAG_GLOBAL,
+		0,
+		windows.DIREG_DRV,
+		uint32(registry.QUERY_VALUE),
+	)
+	if err != nil {
+		return "", err
+	}
+	key := registry.Key(keyHandle)
+	defer key.Close()
+
+	value, _, err := key.GetStringValue("NetCfgInstanceId")
+	if err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
+func removeDevice(devInfo windows.DevInfo, devInfoData *windows.DevInfoData) error {
+	params := windows.RemoveDeviceParams{
+		ClassInstallHeader: *windows.MakeClassInstallHeader(windows.DIF_REMOVE),
+		Scope:              windows.DI_REMOVEDEVICE_GLOBAL,
+	}
+	if err := devInfo.SetClassInstallParams(
+		devInfoData,
+		&params.ClassInstallHeader,
+		uint32(unsafe.Sizeof(params)),
+	); err != nil {
+		return err
+	}
+	return devInfo.CallClassInstaller(windows.DIF_REMOVE, devInfoData)
+}
+
+func removeTunAdapter(adapter tunAdapterInfo) error {
+	targetID := normalizeNetCfgInstanceID(adapter.netCfgInstanceID)
+	if targetID == "" {
+		return errors.New("TUN 网卡缺少 NetCfgInstanceId")
+	}
+
+	devInfo, err := windows.SetupDiGetClassDevsEx(
+		netClassGUID,
+		"",
+		0,
+		windows.DIGCF_PRESENT,
+		0,
+		"",
+	)
+	if err != nil {
+		return err
+	}
+	defer devInfo.Close()
+
+	for i := 0; ; i++ {
+		devInfoData, err := devInfo.EnumDeviceInfo(i)
+		if err != nil {
+			if errors.Is(err, windows.ERROR_NO_MORE_ITEMS) {
+				break
+			}
+			continue
+		}
+
+		netCfgInstanceID, err := deviceNetCfgInstanceID(devInfo, devInfoData)
+		if err != nil {
+			continue
+		}
+		if normalizeNetCfgInstanceID(netCfgInstanceID) != targetID {
+			continue
+		}
+		return removeDevice(devInfo, devInfoData)
+	}
+
+	return fmt.Errorf("找不到 TUN 设备实例: %s", adapter.name)
 }
 
 func cleanupTunWindows(opts TunCleanupOptions) (*TunCleanupResult, error) {
@@ -192,13 +293,17 @@ func cleanupTunWindows(opts TunCleanupOptions) (*TunCleanupResult, error) {
 
 	adapter, err := getTunAdapterInfo(opts.Device, ranges)
 	if err != nil {
+		if errors.Is(err, errTunAdapterNotFound) {
+			return &TunCleanupResult{Device: opts.Device}, nil
+		}
 		return nil, err
 	}
 
+	isTunAdapter := isKnownTunAdapter(*adapter)
 	removedRoutes, hasRoute, err := cleanupTunRoutes(
 		adapter.index,
 		ranges,
-		adapter.hasFakeAddress || adapter.hasFakeDNS,
+		adapter.hasFakeAddress || adapter.hasFakeDNS || isTunAdapter,
 	)
 	if err != nil {
 		return nil, err
@@ -207,7 +312,7 @@ func cleanupTunWindows(opts TunCleanupOptions) (*TunCleanupResult, error) {
 	result := &TunCleanupResult{
 		Device:         adapter.name,
 		InterfaceIndex: adapter.index,
-		Matched:        adapter.hasFakeAddress || adapter.hasFakeDNS || hasRoute,
+		Matched:        adapter.hasFakeAddress || adapter.hasFakeDNS || hasRoute || isTunAdapter,
 		RoutesRemoved:  removedRoutes,
 	}
 	if !result.Matched {
@@ -221,10 +326,10 @@ func cleanupTunWindows(opts TunCleanupOptions) (*TunCleanupResult, error) {
 		result.DNSReset = true
 	}
 
-	if err := disableInterface(adapter.name); err != nil {
+	if err := removeTunAdapter(*adapter); err != nil {
 		return result, err
 	}
-	result.AdapterDisabled = true
+	result.AdapterRemoved = true
 	flushDNSCache()
 	return result, nil
 }

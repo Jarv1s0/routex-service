@@ -19,6 +19,7 @@ type TunCleanupResult struct {
 	RoutesRemoved   int    `json:"routes_removed"`
 	DNSReset        bool   `json:"dns_reset"`
 	AdapterDisabled bool   `json:"adapter_disabled"`
+	AdapterRemoved  bool   `json:"adapter_removed"`
 }
 
 func normalizeTunCleanupOptions(opts TunCleanupOptions) TunCleanupOptions {
