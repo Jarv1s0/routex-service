@@ -56,6 +56,7 @@ func init() {
 	}
 
 	MainCmd.AddCommand(sysproxyCmd)
+	MainCmd.AddCommand(sysCmd)
 	MainCmd.AddCommand(serverCmd)
 	MainCmd.AddCommand(serviceCmd)
 
@@ -63,6 +64,7 @@ func init() {
 	sysproxyCmd.AddCommand(pacCmd)
 	sysproxyCmd.AddCommand(disableCmd)
 	sysproxyCmd.AddCommand(statusCmd)
+	sysCmd.AddCommand(tunCleanupCmd)
 
 	MainCmd.PersistentFlags().BoolVarP(&onlyActiveDevice, "only-active-device", "a", false, "仅对活跃的网络设备生效")
 	MainCmd.PersistentFlags().BoolVarP(&useRegistry, "use-registry", "r", false, "使用注册表设置")
@@ -73,4 +75,5 @@ func init() {
 	proxyCmd.Flags().StringVarP(&bypass, "bypass", "b", "", "绕过地址")
 
 	pacCmd.Flags().StringVarP(&pacUrl, "url", "u", "", "pac 地址")
+	tunCleanupCmd.Flags().StringVar(&tunFakeIPRanges, "fake-ip-ranges", "198.18.0.0/15", "Fake-IP 网段，多个值用逗号分隔")
 }

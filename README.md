@@ -106,6 +106,16 @@ routex-service --only-active-device sysproxy status
 routex-service --use-registry sysproxy status
 ```
 
+## 系统能力命令
+
+清理 Windows TUN 虚拟网卡残留：
+
+```bash
+routex-service --device Meta sys tun-cleanup --fake-ip-ranges 198.18.0.0/15
+```
+
+该命令仅在指定网卡存在 Fake-IP 地址、DNS 或路由时执行清理，用于移除 TUN 关闭后残留的默认路由、DNS 指向和虚拟网卡启用状态。
+
 ## 测试用服务入口
 
 仓库内还有一个测试用途的 `server` 子命令：
@@ -151,6 +161,7 @@ routex-service --listen <addr> service run
 - `POST /sysproxy/proxy`
 - `POST /sysproxy/disable`
 - `POST /sys/dns/set`
+- `POST /sys/tun/cleanup`
 - `POST /service/stop`
 - `POST /service/restart`
 
